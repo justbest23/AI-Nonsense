@@ -1,0 +1,204 @@
+# --- Pod Definition ---
+# File: /etc/containers/systemd/stigman.pod
+
+[Unit]
+Description=Pod for STIG Manager Application Suite (MySQL, Keycloak, API, Nginx)
+# Ensures network connectivity before starting
+Requires=network-online.target
+After=network-online.target
+# Automatically starts containers when the pod starts
+Wants=mysql.service keycloak.service stigman-api.service nginx-revproxy.service
+
+[Pod]
+# Publish ports 80 (for HTTP redirect) and 443 (for HTTPS) from the pod to the host.
+# Nginx inside the pod will listen on these ports.
+PublishPort=80:80
+PublishPort=443:443
+
+[Install]
+# Enable the pod to start on boot
+WantedBy=multi-user.target # Use default.target for user services
+
+# --- MySQL Container ---
+# File: /etc/containers/systemd/mysql.container
+
+[Unit]
+Description=MySQL Database for STIG Manager
+# Requires the pod to exist and be running
+Requires=stigman.pod
+# Ties this container's lifecycle to the pod
+PartOf=stigman.pod
+# Start after the pod network is set up
+After=stigman.pod
+
+[Container]
+# Use an official MySQL 8 image
+Image=docker.io/library/mysql:8.0
+# Assign this container to the 'stigman' pod
+Pod=stigman.pod
+# Use the pod's network namespace (allows localhost communication)
+Network=container:
+# Mount a host directory for persistent MySQL data.
+# Use :Z for SELinux to manage the label automatically for exclusive container access.
+Volume=/var/lib/stigman/mysql:/var/lib/mysql:Z
+
+# Environment variables to configure MySQL
+# IMPORTANT: Replace <generate_strong_password> with secure, unique passwords.
+Environment=MYSQL_ROOT_PASSWORD=<generate_strong_password>
+Environment=MYSQL_DATABASE=stigman # Database name expected by Keycloak and API
+Environment=MYSQL_USER=stigman      # Database user for Keycloak and API
+Environment=MYSQL_PASSWORD=<generate_strong_password> # Password for the 'stigman' user
+
+# Optional: Add MySQL startup arguments if needed
+# Command=--character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+
+# Restart the container if it fails
+Restart=on-failure
+# Keep SELinux separation enabled (recommended)
+SecurityLabelDisable=false
+
+[Install]
+# Ensure this service is wanted by the pod unit
+WantedBy=stigman.pod
+
+# --- Keycloak Container ---
+# File: /etc/containers/systemd/keycloak.container
+
+[Unit]
+Description=Keycloak Authentication Server for STIG Manager
+# Depends on the MySQL service and the pod itself
+Requires=mysql.service stigman.pod
+PartOf=stigman.pod
+# Start after MySQL is running
+After=mysql.service
+
+[Container]
+# Use a specific Keycloak version compatible with your STIG Manager version
+# Check STIG Manager docs for recommended Keycloak versions. Using 21.1.1 as an example.
+Image=quay.io/keycloak/keycloak:21.1.1
+Pod=stigman.pod
+Network=container:
+
+# Optional: Mount host directory for persistent Keycloak data/themes if needed
+# Volume=/var/lib/stigman/keycloak:/opt/keycloak/data:Z
+
+# --- Keycloak Database Configuration ---
+Environment=KC_DB=mysql
+Environment=KC_DB_URL_HOST=localhost # Connect to MySQL via pod's localhost
+Environment=KC_DB_URL_PORT=3306
+Environment=KC_DB_URL_DATABASE=stigman # Use the database created by MySQL container
+Environment=KC_DB_USERNAME=stigman      # Use the user created by MySQL container
+# IMPORTANT: Must match the MYSQL_PASSWORD for the 'stigman' user above
+Environment=KC_DB_PASSWORD=<generate_strong_password>
+
+# --- Keycloak Proxy & Hostname Configuration (CRITICAL) ---
+# Tells Keycloak it's running behind a reverse proxy (Nginx)
+Environment=KC_PROXY=edge
+# IMPORTANT: Set this to your external domain name. Keycloak uses this to generate URLs.
+Environment=KC_HOSTNAME=<your_external_domain>
+# Allow internal HTTP communication (Nginx talks to Keycloak via HTTP)
+Environment=KC_HTTP_ENABLED=true
+# Base path for Keycloak URLs, must match Nginx proxy pass location
+Environment=KC_HTTP_RELATIVE_PATH=/auth
+
+# --- Keycloak Admin User ---
+# IMPORTANT: Change this password immediately after first login!
+# Replace <your_admin_user> and <your_admin_password>
+Environment=KEYCLOAK_ADMIN=<your_admin_user>
+Environment=KEYCLOAK_ADMIN_PASSWORD=<your_admin_password>
+
+# --- Keycloak Start Command ---
+# Modern Keycloak versions (17+) use 'start'. Use '--optimized' for better performance.
+# Use 'start-dev' for development/easier initial setup if needed.
+Command=start --optimized
+
+Restart=on-failure
+SecurityLabelDisable=false
+
+[Install]
+WantedBy=stigman.pod
+
+# --- STIG Manager API Container ---
+# File: /etc/containers/systemd/stigman-api.container
+
+[Unit]
+Description=STIG Manager API Server
+# Depends on MySQL, Keycloak, and the pod
+Requires=mysql.service keycloak.service stigman.pod
+PartOf=stigman.pod
+# Start after Keycloak is likely up and running
+After=keycloak.service
+
+[Container]
+# Use the official STIG Manager API image. Consider pinning to a specific version tag instead of 'latest'.
+Image=docker.io/nuwcdivnpt/stig-manager-api:latest
+Pod=stigman.pod
+Network=container:
+
+# --- Database Connection ---
+Environment=STIGMAN_DB_HOST=localhost # Connect to MySQL via pod's localhost
+Environment=STIGMAN_DB_PORT=3306
+Environment=STIGMAN_DB_NAME=stigman
+Environment=STIGMAN_DB_USER=stigman
+# IMPORTANT: Must match the MYSQL_PASSWORD for the 'stigman' user above
+Environment=STIGMAN_DB_PASSWORD=<generate_strong_password>
+
+# --- OIDC/Keycloak Connection (CRITICAL) ---
+Environment=STIGMAN_OIDC_PROVIDER=keycloak
+# Internal URL for API to reach Keycloak (HTTP because it's inside the pod, proxied by Nginx)
+Environment=STIGMAN_KEYCLOAK_AUTH_SERVER_URL=http://localhost:8080/auth
+# Keycloak realm used by STIG Manager (default is 'stigman')
+Environment=STIGMAN_KEYCLOAK_REALM=stigman
+# Keycloak client ID used by STIG Manager (default is 'stig-manager')
+Environment=STIGMAN_KEYCLOAK_CLIENT_ID=stig-manager
+# IMPORTANT: Generate a strong secret and configure the SAME secret in the Keycloak admin UI for the 'stig-manager' client.
+Environment=STIGMAN_KEYCLOAK_CLIENT_SECRET=<client_secret_you_generate>
+# Public URL where the API is accessible externally (via Nginx)
+Environment=STIGMAN_API_URL=https://<your_external_domain>/api
+# Public URL where the frontend client is accessible externally (via Nginx)
+Environment=STIGMAN_CLIENT_URL=https://<your_external_domain>
+
+# --- Other Settings ---
+Environment=NODE_ENV=production
+# Adjust log level as needed: 'debug', 'info', 'warn', 'error'
+# Environment=STIGMAN_LOG_LEVEL=info
+
+Restart=on-failure
+SecurityLabelDisable=false
+
+[Install]
+WantedBy=stigman.pod
+
+# --- Nginx Reverse Proxy Container ---
+# File: /etc/containers/systemd/nginx-revproxy.container
+
+[Unit]
+Description=Nginx Reverse Proxy for STIG Manager
+# Depends on the API, Keycloak, and the pod
+Requires=stigman-api.service keycloak.service stigman.pod
+PartOf=stigman.pod
+# Start after the backend services it proxies
+After=stigman-api.service keycloak.service
+
+[Container]
+# Use a stable Nginx image
+Image=docker.io/library/nginx:stable
+Pod=stigman.pod
+Network=container:
+
+# --- Volume Mounts ---
+# Mount the Nginx config directory (read-only). Assumes stigman.conf is in /etc/stigman/nginx/conf.d on the host.
+Volume=/etc/stigman/nginx/conf.d:/etc/nginx/conf.d:ro,Z
+# Mount the TLS certificates directory (read-only). Assumes certs are in /etc/stigman/nginx/certs on the host.
+Volume=/etc/stigman/nginx/certs:/etc/nginx/certs:ro,Z
+# Mount the STIG Manager Client static files (read-only). Assumes files are in /var/lib/stigman/client on the host.
+Volume=/var/lib/stigman/client:/usr/share/nginx/html:ro,Z
+
+# Nginx needs its log directory; create it if it doesn't exist inside the container on start.
+ExecStartPre=mkdir -p /var/log/nginx
+
+Restart=on-failure
+SecurityLabelDisable=false
+
+[Install]
+WantedBy=stigman.pod
