@@ -1,0 +1,133 @@
+Here's a thinking process that leads to the Podman quadlet configuration for STIG Manager:
+
+    Understand the Goal: The user wants to deploy STIG Manager (API, Keycloak, MySQL, Nginx reverse proxy) using Podman quadlets. The key requirement is to make it externally accessible via HTTPS, overcoming the limitations of the demo docker-compose which is localhost-only due to the API's TLS requirement for non-localhost connections.
+
+    Identify the Components: The user explicitly states the four required containers:
+        keycloak: Authentication/Authorization.
+        mysql: Database for STIG Manager data.
+        stigman-api: The core STIG Manager backend.
+        nginx (Reverse Proxy): Handles incoming connections, terminates TLS, and forwards requests to the appropriate backend (API or Keycloak).
+
+    Recall Podman Quadlets: What are quadlets? They are systemd unit files (.container, .volume, .network, .kube, .pod) that define containers, volumes, networks, Kubernetes YAML deployments, or pods, respectively, managed by systemd. This allows containers to be managed like system services (start on boot, stop, status, logging via journalctl).
+
+    Structure the Deployment: The user wants a pod. This is a good fit because containers within a pod share network namespaces (can communicate via localhost) and potentially IPC namespaces. This simplifies inter-container communication. The Nginx reverse proxy needs to be exposed outside the pod.
+
+    Define the Pod: Start by creating a .pod file. This will group the containers.
+        Name: stigman.pod (or similar).
+        Contents: Basic [Unit] section (description, dependencies), [Pod] section (define published ports), [Install] section (when to start).
+        Published Ports: The Nginx reverse proxy will handle external traffic. Standard ports are 80 (HTTP, maybe for redirect) and 443 (HTTPS). So, publish 443:443 and potentially 80:80. Let's start with just 443 for simplicity, assuming TLS termination at Nginx.
+
+    Define Volumes: Persistent data is crucial for Keycloak and MySQL. STIG Manager API might also have data/configuration, but the documentation focuses on the database.
+        mysql-data.volume: For MySQL database files.
+        keycloak-data.volume: For Keycloak data/configuration (though Keycloak often uses its own database; check documentation - ah, it uses the same MySQL DB in this setup, but might have its own config files/themes that need persistence). Let's assume separate volumes for clarity initially.
+        nginx-certs.volume: To store the TLS certificates for Nginx. Crucial for external access.
+        nginx-conf.volume: To store the Nginx configuration file. This makes configuration manageable outside the container.
+
+    Define Containers (.container files): Each service needs a container definition.
+
+        MySQL (mysql.container):
+            [Unit]: Description, dependencies (requires network, part of stigman.pod).
+            [Container]:
+                Image: mysql:8.0 (or a specific version preferred).
+                Pod: stigman.pod.
+                Environment Variables: MYSQL_ROOT_PASSWORD, MYSQL_DATABASE, MYSQL_USER, MYSQL_PASSWORD. These need to be consistent across containers that use the DB. Generate secure passwords.
+                Volumes: Mount mysql-data.volume to /var/lib/mysql.
+                Security/SELinux: Consider SecurityLabelDisable=true or SecurityLabelFileType=container_file_t if SELinux issues arise, but try without first.
+                Restart Policy: on-failure.
+            [Install]: WantedBy stigman.pod.
+
+        Keycloak (keycloak.container):
+            [Unit]: Description, dependencies (mysql.service, part of stigman.pod).
+            [Container]:
+                Image: quay.io/keycloak/keycloak:latest (or a specific supported version). Check STIG Manager docs for compatibility. Let's use a specific version like 21.1.1 for stability.
+                Pod: stigman.pod.
+                Environment Variables:
+                    KC_DB=mysql
+                    KC_DB_URL_HOST=localhost (since it's in the same pod)
+                    KC_DB_URL_DATABASE=<stigman_db_name> (same as MySQL)
+                    KC_DB_USERNAME=<stigman_db_user> (same as MySQL)
+                    KC_DB_PASSWORD=<stigman_db_password> (same as MySQL)
+                    KC_HTTP_ENABLED=true (Nginx handles TLS)
+                    KC_PROXY=edge (Important! Tells Keycloak it's behind a proxy)
+                    KC_HOSTNAME=<your_external_domain> (Crucial! Keycloak needs its public URL)
+                    KEYCLOAK_ADMIN=<admin_user>
+                    KEYCLOAK_ADMIN_PASSWORD=<admin_password>
+                Command: /opt/keycloak/bin/kc.sh start --optimized (or start-dev for initial testing, but start for production). The --optimized flag might be needed after initial setup. Check Keycloak docs. Let's stick with the default entrypoint/command first unless issues arise. The environment variables configure the start command implicitly in modern Keycloak versions.
+                Volumes: Maybe mount /opt/keycloak/data if needed using keycloak-data.volume? Check Keycloak docs. Let's omit this for now if it uses the DB primarily.
+                Restart Policy: on-failure.
+            [Install]: WantedBy stigman.pod.
+
+        STIG Manager API (stigman-api.container):
+            [Unit]: Description, dependencies (mysql.service, keycloak.service, part of stigman.pod).
+            [Container]:
+                Image: nuwcdivnpt/stig-manager-api:latest (Use a specific tag if possible).
+                Pod: stigman.pod.
+                Environment Variables:
+                    STIGMAN_DB_HOST=localhost
+                    STIGMAN_DB_PORT=3306
+                    STIGMAN_DB_NAME=<stigman_db_name>
+                    STIGMAN_DB_USER=<stigman_db_user>
+                    STIGMAN_DB_PASSWORD=<stigman_db_password>
+                    STIGMAN_OIDC_PROVIDER=keycloak
+                    STIGMAN_KEYCLOAK_AUTH_SERVER_URL=http://localhost:8080 (Internal communication within the pod to Keycloak's default HTTP port)
+                    STIGMAN_KEYCLOAK_REALM=stigman (Default, confirm in docs/setup)
+                    STIGMAN_KEYCLOAK_CLIENT_ID=stig-manager (Default, confirm)
+                    STIGMAN_KEYCLOAK_CLIENT_SECRET=<generate_a_secret> (Needs to be set in Keycloak config too!)
+                    NODE_ENV=production (Important)
+                    STIGMAN_API_URL=https://<your_external_domain>/api (Crucial! API needs its public URL)
+                    STIGMAN_CLIENT_URL=https://<your_external_domain> (Crucial! Where the UI is expected)
+                Restart Policy: on-failure.
+            [Install]: WantedBy stigman.pod.
+
+        Nginx Reverse Proxy (nginx.container):
+            [Unit]: Description, dependencies (stigman-api.service, keycloak.service, part of stigman.pod). Needs to start after backends ideally, though systemd handles this.
+            [Container]:
+                Image: nginx:latest (or nginx:stable).
+                Pod: stigman.pod.
+                Volumes:
+                    nginx-conf.volume:/etc/nginx/conf.d (Mount the config directory)
+                    nginx-certs.volume:/etc/nginx/certs (Mount the certificates)
+                Restart Policy: on-failure.
+            [Install]: WantedBy stigman.pod.
+
+    Nginx Configuration (nginx.conf): This is the trickiest part. It needs to:
+        Listen on port 443 SSL.
+        Use the TLS certificates mounted via nginx-certs.volume.
+        Define server name (<your_external_domain>).
+        Proxy requests to Keycloak (/auth/*) and the STIG Manager API (/api/*). Need to check the exact paths Keycloak uses (often /auth/ or just /). STIGMan docs say API is at /api. Assume Keycloak is at /auth.
+        Proxy requests for the STIGMan frontend (root /). Where does the frontend come from? The stig-manager image likely only contains the API. The docs mention a separate UI deployment or maybe it's served by the API container itself? Re-read the docs/docker-compose example. Ah, the standard deployment assumes a separate frontend build/deployment. For this setup, let's assume the Nginx proxy also needs to serve the static frontend files. We'll need another volume for the frontend files or modify the Nginx container to include them. Alternative: The stig-manager-api image might serve the frontend too. Let's assume the API serves the frontend from / for now and route / to the API container.
+        Set necessary proxy headers (X-Forwarded-For, X-Forwarded-Proto, Host). X-Forwarded-Proto https is critical for Keycloak (KC_PROXY=edge).
+        Define upstream blocks or just proxy directly to localhost:<port> since they are in the same pod. API default port is 54000, Keycloak is 8080.
+
+    TLS Certificates: The user needs valid TLS certificates for <your_external_domain>. These need to be placed in the host directory that maps to nginx-certs.volume before starting the pod. Certbot/Let's Encrypt is a common way to get these. The files (fullchain.pem, privkey.pem) need to be referenced in nginx.conf.
+
+    Secrets Management: Hardcoding passwords in quadlet files isn't ideal. Podman supports secrets. However, for simplicity in this initial setup, environment variables are used. Note: Remind the user about better secret management (Podman secrets, environment files, Vault, etc.).
+
+    Putting it Together (File Structure):
+        Create a directory, e.g., /etc/containers/systemd/ (or ~/.config/containers/systemd/ for user units).
+        Place .pod, .volume, and .container files there.
+        Create host directories for volumes: e.g., /var/lib/stigman/mysql, /var/lib/stigman/keycloak, /etc/stigman/nginx/conf.d, /etc/stigman/nginx/certs.
+        Place nginx.conf in /etc/stigman/nginx/conf.d/.
+        Place TLS certs in /etc/stigman/nginx/certs/.
+        Set correct ownership/permissions if needed (especially for volume directories).
+
+    Deployment Steps:
+        Place files.
+        systemctl --user daemon-reload (if using user units) or systemctl daemon-reload (if using system units).
+        systemctl --user start stigman.pod (or systemctl start stigman.pod).
+        Check status: systemctl --user status stigman.pod mysql.service keycloak.service stigman-api.service nginx.service.
+        Check logs: journalctl --user -u stigman.pod -f (or without --user for system). podman logs <container_name> can also be used.
+
+    Refinement & Review:
+        Domain Name: Emphasize replacing <your_external_domain> everywhere.
+        Passwords: Emphasize generating strong, unique passwords and replacing placeholders.
+        Keycloak Client Secret: Highlight that the secret in the API env vars must match the one configured within Keycloak for the stig-manager client. This requires initial Keycloak setup.
+        Keycloak Realm/Client: Confirm default names (stigman, stig-manager) or instruct the user to change them consistently.
+        STIGMan Frontend: Reiterate the assumption about where the frontend is served (API or separate). If separate, the Nginx config needs adjustment. The STIG Manager documentation does have a separate stig-manager-client component. The API doesn't serve the UI. This means the Nginx config needs to serve static files, or a fifth container is needed to serve the client. Let's modify the Nginx part to serve static files from a volume. Add stigman-client.volume. Nginx needs to serve files from there for / and proxy /api and /auth.
+        Initial Setup: Keycloak realm import/configuration needs to happen. The STIG Manager docs likely cover this. This might involve running a command or accessing the Keycloak UI initially. The API might need database migrations on first run.
+        Ports: Double-check default ports (MySQL 3306, Keycloak 8080, API 54000). Ensure Nginx proxies to the correct internal ports.
+        Quadlet Dependencies: Ensure Requires= and After= directives in [Unit] sections are logical (e.g., DB before services using it). systemd generally handles dependencies within a PartOf= pod well, but explicit ordering can help.
+        Resource Limits: Add potential [Container] options like Memory= and CPU= if needed.
+        SELinux: Mention potential SELinux issues, especially with volume mounts, and suggest z or Z flags on volume mounts (:z for shared content, :Z for private content) or checking audit.log.
+
+    Final Output Structure: Organize the answer clearly: Introduction, Prerequisites, Volume Definitions, Container Definitions (MySQL, Keycloak, API, Nginx), Nginx Configuration explanation, Deployment Steps, Important Considerations (Secrets, Domain, Keycloak Setup, Frontend, SELinux, Firewall). Provide the actual quadlet file contents in code blocks.
